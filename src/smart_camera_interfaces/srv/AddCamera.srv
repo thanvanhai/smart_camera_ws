@@ -1,0 +1,8 @@
+# Request
+string camera_id
+string camera_url
+
+---
+# Response
+bool success
+string message
