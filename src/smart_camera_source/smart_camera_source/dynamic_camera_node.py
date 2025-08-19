@@ -15,8 +15,8 @@ class DynamicCameraNode(Node):
         
         # Camera storage
         self.cameras = {}  # {camera_id: cv2.VideoCapture}
-        self.publishers = {}  # {camera_id: Publisher}
-        self.timers = {}  # {camera_id: Timer}
+        self.camera_publishers = {}  # {camera_id: Publisher}
+        self.camera_timers = {}  # {camera_id: Timer}
         
         # Services
         self.srv_add = self.create_service(
@@ -62,14 +62,14 @@ class DynamicCameraNode(Node):
             
             # Create publisher
             topic_name = f'/camera/{camera_id}/frames'
-            self.publishers[camera_id] = self.create_publisher(
+            self.camera_publishers[camera_id] = self.create_publisher(
                 Image, 
                 topic_name, 
                 10
             )
             
             # Create timer for this camera
-            self.timers[camera_id] = self.create_timer(
+            self.camera_timers[camera_id] = self.create_timer(
                 0.033,  # ~30 FPS
                 lambda camera=camera_id: self.capture_frame(camera)
             )
@@ -95,9 +95,9 @@ class DynamicCameraNode(Node):
                 return response
             
             # Stop timer
-            if camera_id in self.timers:
-                self.timers[camera_id].cancel()
-                del self.timers[camera_id]
+            if camera_id in self.camera_timers:
+                self.camera_timers[camera_id].cancel()
+                del self.camera_timers[camera_id]
             
             # Release camera
             if camera_id in self.cameras:
@@ -105,8 +105,8 @@ class DynamicCameraNode(Node):
                 del self.cameras[camera_id]
             
             # Remove publisher
-            if camera_id in self.publishers:
-                del self.publishers[camera_id]
+            if camera_id in self.camera_publishers:
+                del self.camera_publishers[camera_id]
             
             response.success = True
             response.message = f"✅ Camera {camera_id} removed successfully"
@@ -133,7 +133,7 @@ class DynamicCameraNode(Node):
                 msg.header.stamp = self.get_clock().now().to_msg()
                 
                 # Publish
-                self.publishers[camera_id].publish(msg)
+                self.camera_publishers[camera_id].publish(msg)
             else:
                 self.get_logger().warn(f"⚠️ Failed to read frame from {camera_id}")
         except Exception as e:

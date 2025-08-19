@@ -21,8 +21,6 @@ setup(
     license='Apache-2.0',
     entry_points={
         'console_scripts': [
-            'camera_node = smart_camera_source.camera_node:main',
-            'camera_manager_node = smart_camera_source.camera_manager_node:main',
             'dynamic_camera_node = smart_camera_source.dynamic_camera_node:main',
         ],
     },
