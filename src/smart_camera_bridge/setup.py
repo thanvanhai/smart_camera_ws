@@ -23,4 +23,8 @@ setup(
             'bridge_node = smart_camera_bridge.bridge_node:main',
         ],
     },
+     package_data={
+        'smart_camera_bridge': ['rabbitmq.json'],  # 👈 thêm dòng này
+    },
+    include_package_data=True,
 )

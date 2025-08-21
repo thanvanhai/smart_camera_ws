@@ -1,0 +1,7 @@
+{
+  "url": "amqp://guest:guest@localhost:5672/",
+  "exchange": {
+    "cameras": "camera.events",
+    "detections": "detections.events"
+  }
+}
