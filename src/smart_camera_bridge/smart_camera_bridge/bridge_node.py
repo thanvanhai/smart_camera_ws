@@ -79,7 +79,10 @@ class BridgeNode(Node):
                     break
                 continue
             try:
+                #kiểm tra dữ liệu nhận được có đúng hay không?
+                # self.get_logger().info(f"📦 Raw message: {body}")
                 payload = json.loads(body.decode())
+                # self.get_logger().info(f"📦 Decoded payload: {payload}")
                 action = payload.get("action")
                 camera_id = str(payload.get("camera_id"))
                 camera_url = payload.get("camera_url")
