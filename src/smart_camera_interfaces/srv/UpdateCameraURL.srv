@@ -1,0 +1,8 @@
+# Request
+string camera_id      # ID của camera cần update
+string new_url        # URL mới cho camera
+
+---
+# Response
+bool success          # True nếu cập nhật thành công
+string message        # Thông báo kết quả
