@@ -113,7 +113,7 @@ class VideoStreamBridge(Node):
         """Callback xử lý mỗi frame ảnh."""
         try:
             cv_image = self.bridge.imgmsg_to_cv2(msg, "bgr8")
-            _, buffer = cv.imencode('.jpg', cv_image)
+            _, buffer = cv2.imencode('.jpg', cv_image)
             frame_b64 = base64.b64encode(buffer).decode('utf-8')
             
             payload = {

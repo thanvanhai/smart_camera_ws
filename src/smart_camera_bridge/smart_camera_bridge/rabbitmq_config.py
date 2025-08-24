@@ -8,9 +8,9 @@ class RabbitMQConfig:
         self.port = int(os.getenv('RABBITMQ_PORT', 5672))
         self.url = f"amqp://{self.user}:{self.password}@{self.host}:{self.port}/"
         
-        # Exchanges
-        self.exchange_cameras = 'cameras.events'
-        self.exchange_detections = 'detections.events'
+        # Exchanges phải khớp 100% với bên ở backend ../smart_camera_backend/app/services/rabbitmq_service.py
+        self.exchange_cameras = "camera.events"
+        self.exchange_detections = "detections.events"
         
         # Queues (dùng cho stream)
         self.queue_stream_prefix = 'camera.stream'

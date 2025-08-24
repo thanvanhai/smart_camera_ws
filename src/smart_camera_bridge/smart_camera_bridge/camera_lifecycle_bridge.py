@@ -4,12 +4,12 @@ import time
 import pika
 import rclpy
 from rclpy.node import Node
-from rclpy.task import Future
 from .rabbitmq_config import RabbitMQConfig
 from smart_camera_interfaces.srv import AddCamera, RemoveCamera
 
 class CameraLifecycleBridge(Node):
     """Node quản lý vòng đời camera: Lắng nghe RabbitMQ và gọi service ROS."""
+
     def __init__(self):
         super().__init__('camera_lifecycle_bridge')
         
@@ -28,7 +28,10 @@ class CameraLifecycleBridge(Node):
         self._stop_flag = threading.Event()
         
         # Start consumer thread
-        self.consumer_thread = threading.Thread(target=self._consume_camera_events, daemon=True)
+        self.consumer_thread = threading.Thread(
+            target=self._consume_camera_events, 
+            daemon=True
+        )
         self.consumer_thread.start()
         self.get_logger().info("✅ CameraLifecycleBridge initialized.")
 
@@ -46,14 +49,15 @@ class CameraLifecycleBridge(Node):
 
     def _consume_camera_events(self):
         """Vòng lặp tiêu thụ message thêm/xóa camera với cơ chế retry."""
+        queue_name = f"camera_lifecycle.{self.get_name()}"
         while not self._stop_flag.is_set():
             try:
                 self._connect_rabbitmq()
-                result = self.channel.queue_declare(queue='', exclusive=True)
-                queue_name = result.method.queue
+                # Khai báo queue riêng, durable để tồn tại ngay cả khi node tắt
+                self.channel.queue_declare(queue=queue_name, durable=True, auto_delete=False)
                 self.channel.queue_bind(exchange=self.cfg.exchange_cameras, queue=queue_name)
                 
-                self.get_logger().info("🔗 Start consuming camera lifecycle events...")
+                self.get_logger().info(f"🔗 Start consuming camera lifecycle events on queue [{queue_name}]...")
                 for method, _, body in self.channel.consume(queue_name, auto_ack=True):
                     if self._stop_flag.is_set():
                         break
