@@ -22,6 +22,7 @@ setup(
     entry_points={
         'console_scripts': [
             'dynamic_camera_node = smart_camera_source.dynamic_camera_node:main',
+            'camera_manager_node = smart_camera_source.camera_manager_node:main',            
         ],
     },
 )
