@@ -25,6 +25,7 @@ setup(
             'camera_lifecycle_bridge = smart_camera_bridge.camera_lifecycle_bridge:main',
             'detection_bridge = smart_camera_bridge.detection_bridge:main',
             'video_stream_bridge = smart_camera_bridge.video_stream_bridge:main',
+            'video_stream_bridge_test = smart_camera_bridge.video_stream_bridge_test:main',
         ],
     },
      package_data={

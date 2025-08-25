@@ -1,5 +1,3 @@
-# Tên file: camera_manager_node.py
-
 import rclpy
 from rclpy.node import Node
 from sensor_msgs.msg import Image
@@ -9,119 +7,149 @@ from smart_camera_interfaces.srv import AddCamera, RemoveCamera, UpdateCameraURL
 import threading
 import time
 import requests
-import queue
+import json
+import pika  # RabbitMQ
 from typing import Dict, Tuple, Optional
 
 
 class CameraManagerNode(Node):
     """
-    Node quản lý camera phiên bản tối ưu tích hợp:
+    Camera Manager (low-latency version)
     - Health monitoring + auto-reconnect
-    - Backend sync với duplicate prevention
-    - Frame buffer + frame dropping
-    - Configurable FPS và max buffer
-    - Cleanup resources đầy đủ
+    - Backend sync (auto add cameras)
+    - Low-latency capture (grab/retrieve) – always publish newest frame
+    - Configurable FPS, frame_width, frame_height via ROS params
+    - Watchdog to restart stuck threads
+    - RabbitMQ camera lifecycle events (created/removed)
+    - Clean shutdown
     """
 
     def __init__(self):
         super().__init__('camera_manager_node')
 
-        # ROS Parameters
+        # -------------------- ROS Parameters --------------------
         self.declare_parameter('backend_api_url', 'http://localhost:8000/api/v1/cameras')
         self.declare_parameter('default_fps', 30.0)
-        self.declare_parameter('max_buffer_size', 10)
+        self.declare_parameter('frame_width', 640)
+        self.declare_parameter('frame_height', 480)
         self.declare_parameter('reconnect_interval', 5.0)
         self.declare_parameter('health_check_interval', 10.0)
         self.declare_parameter('backend_sync_interval', 60)
         self.declare_parameter('watchdog_interval', 10)
+        self.declare_parameter('rabbitmq_url', 'amqp://guest:guest@localhost:5672/')
+        self.declare_parameter('rabbitmq_exchange', 'camera_events')
 
-        # CvBridge
+        # Bridge
         self.bridge = CvBridge()
 
         # Thread-safe storage
         self.cameras: Dict[str, cv2.VideoCapture] = {}
-        self.camera_publishers: Dict[str, rclpy.publisher.Publisher] = {}
+        self.camera_publishers: Dict[str, any] = {}
         self.camera_threads: Dict[str, threading.Thread] = {}
         self.camera_stop_events: Dict[str, threading.Event] = {}
         self.camera_health_status: Dict[str, bool] = {}
-        self.camera_configs: Dict[str, dict] = {}  # url, fps, max_buffer_size
+        self.camera_configs: Dict[str, dict] = {}  # url, fps, width, height
         self._lock = threading.Lock()
         self._shutdown_event = threading.Event()
 
-        # ROS Services
+        # Services
         self.srv_add = self.create_service(AddCamera, '/camera/add', self.add_camera_callback)
         self.srv_remove = self.create_service(RemoveCamera, '/camera/remove', self.remove_camera_callback)
         self.srv_update_url = self.create_service(UpdateCameraURL, '/camera/update_url', self.update_camera_url_callback)
 
-        self.get_logger().info("🚀Camera Manager Node initialized.")
+        # RabbitMQ
+        self.rabbitmq_url = self.get_parameter('rabbitmq_url').get_parameter_value().string_value
+        self.rabbitmq_exchange = self.get_parameter('rabbitmq_exchange').get_parameter_value().string_value
+        self._setup_rabbitmq()
 
-        # Start background threads
+        self.get_logger().info('🚀 Camera Manager Node initialized (low-latency mode).')
+
+        # Background services
         self._start_background_services()
+
+    # -------------------- RabbitMQ --------------------
+    def _setup_rabbitmq(self):
+        try:
+            params = pika.URLParameters(self.rabbitmq_url)
+            self.rabbit_connection = pika.BlockingConnection(params)
+            self.rabbit_channel = self.rabbit_connection.channel()
+            self.rabbit_channel.exchange_declare(exchange=self.rabbitmq_exchange, exchange_type='fanout', durable=True)
+            self.get_logger().info(f"🐇 RabbitMQ exchange '{self.rabbitmq_exchange}' ready")
+        except Exception as e:
+            self.get_logger().error(f"❌ RabbitMQ setup failed: {e}")
+            self.rabbit_connection = None
+            self.rabbit_channel = None
+
+    def _publish_camera_event(self, action: str, camera_id: str):
+        if not self.rabbit_channel:
+            return
+        payload = json.dumps({"action": action, "camera_id": camera_id})
+        try:
+            self.rabbit_channel.basic_publish(exchange=self.rabbitmq_exchange, routing_key='', body=payload)
+            self.get_logger().info(f"🐇 Published camera event: {payload}")
+        except Exception as e:
+            self.get_logger().error(f"❌ Failed to publish camera event: {e}")
 
     # -------------------- Background Services --------------------
     def _start_background_services(self):
-        """Start health monitor, backend sync, watchdog threads"""
-        threading.Thread(target=self._health_monitoring_loop, daemon=True, name="HealthMonitor").start()
-        threading.Thread(target=self._backend_sync_loop, daemon=True, name="BackendSync").start()
-        threading.Thread(target=self._watchdog_loop, daemon=True, name="Watchdog").start()
+        threading.Thread(target=self._health_monitoring_loop, daemon=True, name='HealthMonitor').start()
+        threading.Thread(target=self._backend_sync_loop, daemon=True, name='BackendSync').start()
+        threading.Thread(target=self._watchdog_loop, daemon=True, name='Watchdog').start()
 
-    # -------------------- Camera Capture Loop --------------------
+    # -------------------- Camera Capture Loop (LOW LATENCY) --------------------
     def _camera_capture_loop(self, camera_id: str, stop_event: threading.Event):
         config = self.camera_configs[camera_id]
-        fps = config.get("fps", 30.0)
-        max_buffer_size = config.get("max_buffer_size", 10)
-        frame_interval = 1.0 / fps
+        fps = float(config.get('fps', 30.0))
+        frame_interval = 1.0 / fps if fps > 0 else 0.033
 
-        frame_buffer = queue.Queue(maxsize=max_buffer_size)
         consecutive_failures = 0
         max_failures = 10
 
-        self.get_logger().info(f"THREAD [{camera_id}]: Capture loop started (FPS: {fps})")
+        self.get_logger().info(f"THREAD [{camera_id}]: Real-time capture loop started (FPS: {fps})")
 
         while not stop_event.is_set() and not self._shutdown_event.is_set():
             loop_start = time.time()
+
             with self._lock:
                 cap = self.cameras.get(camera_id)
                 pub = self.camera_publishers.get(camera_id)
+                desired_w = int(self.camera_configs[camera_id].get('width', 0) or 0)
+                desired_h = int(self.camera_configs[camera_id].get('height', 0) or 0)
 
             if not cap or not pub:
+                self.get_logger().warning(f"THREAD [{camera_id}]: Capture object or publisher missing; stopping.")
                 break
 
             try:
-                ret, frame = cap.read()
+                # Flush old frames in internal buffer; get the newest
+                cap.grab()
+                ret, frame = cap.retrieve()
+
                 if ret and frame is not None:
                     consecutive_failures = 0
                     with self._lock:
                         self.camera_health_status[camera_id] = True
 
-                    # Frame dropping
-                    if frame_buffer.full():
-                        try:
-                            frame_buffer.get_nowait()
-                        except queue.Empty:
-                            pass
+                    # Optional: enforce output resolution if params set and camera ignored CAP_PROP*
+                    if desired_w > 0 and desired_h > 0:
+                        h, w = frame.shape[:2]
+                        if (w != desired_w) or (h != desired_h):
+                            frame = cv2.resize(frame, (desired_w, desired_h), interpolation=cv2.INTER_AREA)
+
+                    # Publish newest frame immediately
                     try:
-                        frame_buffer.put_nowait(frame)
-                    except queue.Full:
-                        pass
-
-                    # Publish
-                    if not frame_buffer.empty():
-                        try:
-                            current_frame = frame_buffer.get_nowait()
-                            msg = self.bridge.cv2_to_imgmsg(current_frame, encoding="bgr8")
-                            msg.header.frame_id = camera_id
-                            msg.header.stamp = self.get_clock().now().to_msg()
-                            pub.publish(msg)
-                        except Exception as e:
-                            self.get_logger().error(f"THREAD [{camera_id}]: Error publishing frame: {e}")
-
+                        msg = self.bridge.cv2_to_imgmsg(frame, encoding='bgr8')
+                        msg.header.frame_id = camera_id
+                        msg.header.stamp = self.get_clock().now().to_msg()
+                        pub.publish(msg)
+                    except Exception as e:
+                        self.get_logger().error(f"THREAD [{camera_id}]: Error publishing frame: {e}")
                 else:
                     consecutive_failures += 1
                     with self._lock:
                         self.camera_health_status[camera_id] = False
                     if consecutive_failures >= max_failures:
-                        self.get_logger().error(f"THREAD [{camera_id}]: Too many failures, marking unhealthy")
+                        self.get_logger().error(f"THREAD [{camera_id}]: Too many read failures; marking unhealthy and stopping.")
                         break
                     time.sleep(1)
 
@@ -132,9 +160,9 @@ class CameraManagerNode(Node):
                 self.get_logger().error(f"THREAD [{camera_id}]: Exception in capture loop: {e}")
                 time.sleep(1)
 
-            # Maintain FPS
+            # Throttle to target FPS
             elapsed = time.time() - loop_start
-            sleep_time = max(0, frame_interval - elapsed)
+            sleep_time = max(0.0, frame_interval - elapsed)
             if sleep_time > 0:
                 time.sleep(sleep_time)
 
@@ -150,11 +178,16 @@ class CameraManagerNode(Node):
             if not cap or not cap.isOpened():
                 return False, f"Cannot open camera stream: {camera_url}"
 
+            fps = self.get_parameter('default_fps').get_parameter_value().double_value
+            width = self.get_parameter('frame_width').get_parameter_value().integer_value
+            height = self.get_parameter('frame_height').get_parameter_value().integer_value
+
             self.camera_configs[camera_id] = {
                 'url': camera_url,
-                'fps': self.get_parameter('default_fps').get_parameter_value().double_value,
-                'max_buffer_size': self.get_parameter('max_buffer_size').get_parameter_value().integer_value,
-                'added_time': time.time()
+                'fps': fps,
+                'width': int(width),
+                'height': int(height),
+                'added_time': time.time(),
             }
 
             topic_name = f'/camera/{camera_id}/frames'
@@ -163,14 +196,21 @@ class CameraManagerNode(Node):
             self.camera_health_status[camera_id] = True
 
             stop_event = threading.Event()
-            thread = threading.Thread(target=self._camera_capture_loop, args=(camera_id, stop_event),
-                                      daemon=True, name=f"Camera-{camera_id}")
+            thread = threading.Thread(
+                target=self._camera_capture_loop,
+                args=(camera_id, stop_event),
+                daemon=True,
+                name=f"Camera-{camera_id}"
+            )
             self.camera_stop_events[camera_id] = stop_event
             self.camera_threads[camera_id] = thread
             thread.start()
 
-            self.get_logger().info(f"✅ Added camera {camera_id} publishing to: {topic_name}")
-            return True, f"Camera {camera_id} added successfully"
+        # Notify via RabbitMQ
+        self._publish_camera_event('created', camera_id)
+
+        self.get_logger().info(f"✅ Added camera {camera_id} publishing to: {topic_name}")
+        return True, f"Camera {camera_id} added successfully"
 
     def _internal_remove_camera(self, camera_id: str) -> Tuple[bool, str]:
         with self._lock:
@@ -200,15 +240,36 @@ class CameraManagerNode(Node):
             if camera_id in self.camera_configs:
                 del self.camera_configs[camera_id]
 
+        # Notify via RabbitMQ
+        self._publish_camera_event('removed', camera_id)
+
         return True, f"Camera {camera_id} removed successfully"
 
     def _open_camera_with_config(self, camera_url: str) -> Optional[cv2.VideoCapture]:
+        # Open camera/stream
         if camera_url.isdigit():
             cap = cv2.VideoCapture(int(camera_url))
         else:
             cap = cv2.VideoCapture(camera_url)
+
         if cap.isOpened():
-            cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+            # Reduce internal buffering and try to apply desired properties
+            try:
+                cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+            except Exception:
+                pass
+
+            # Try set width/height/FPS (some sources may ignore)
+            w = self.get_parameter('frame_width').get_parameter_value().integer_value
+            h = self.get_parameter('frame_height').get_parameter_value().integer_value
+            fps = self.get_parameter('default_fps').get_parameter_value().double_value
+            if int(w) > 0:
+                cap.set(cv2.CAP_PROP_FRAME_WIDTH, int(w))
+            if int(h) > 0:
+                cap.set(cv2.CAP_PROP_FRAME_HEIGHT, int(h))
+            if float(fps) > 0:
+                cap.set(cv2.CAP_PROP_FPS, float(fps))
+
         return cap
 
     # -------------------- Service Callbacks --------------------
@@ -273,7 +334,7 @@ class CameraManagerNode(Node):
                 self.fetch_cameras_from_backend()
             except Exception as e:
                 self.get_logger().error(f"Backend sync error: {e}")
-            for _ in range(interval):
+            for _ in range(int(interval)):
                 if self._shutdown_event.is_set():
                     break
                 time.sleep(1)
@@ -308,7 +369,7 @@ class CameraManagerNode(Node):
                         threads_to_restart.append(cam_id)
             for cam_id in threads_to_restart:
                 self._restart_camera_thread(cam_id)
-            time.sleep(interval)
+            time.sleep(int(interval))
 
     def _restart_camera_thread(self, camera_id: str):
         try:
@@ -324,10 +385,12 @@ class CameraManagerNode(Node):
             with self._lock:
                 if camera_id in self.cameras:
                     new_stop_event = threading.Event()
-                    new_thread = threading.Thread(target=self._camera_capture_loop,
-                                                  args=(camera_id, new_stop_event),
-                                                  daemon=True,
-                                                  name=f"Camera-{camera_id}-Restarted")
+                    new_thread = threading.Thread(
+                        target=self._camera_capture_loop,
+                        args=(camera_id, new_stop_event),
+                        daemon=True,
+                        name=f"Camera-{camera_id}-Restarted"
+                    )
                     self.camera_stop_events[camera_id] = new_stop_event
                     self.camera_threads[camera_id] = new_thread
                     self.camera_health_status[camera_id] = True
@@ -342,7 +405,9 @@ class CameraManagerNode(Node):
         camera_ids = list(self.cameras.keys())
         for cam_id in camera_ids:
             self._internal_remove_camera(cam_id)
-        self.get_logger().info("Cleanup completed")
+        self.get_logger().info('Cleanup completed')
+        if hasattr(self, 'rabbit_connection') and self.rabbit_connection and not self.rabbit_connection.is_closed:
+            self.rabbit_connection.close()
 
 
 def main(args=None):
@@ -351,7 +416,7 @@ def main(args=None):
     try:
         rclpy.spin(node)
     except KeyboardInterrupt:
-        node.get_logger().info("Received shutdown signal")
+        node.get_logger().info('Received shutdown signal')
     finally:
         node.cleanup_all_resources()
         node.destroy_node()
